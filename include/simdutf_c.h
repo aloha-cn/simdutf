@@ -12,6 +12,8 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#ifdef __cplusplus
+#else
 #ifdef __has_include
   #if __has_include(<uchar.h>)
     #include <uchar.h>
@@ -23,6 +25,7 @@
   #define char16_t uint16_t
   #define char32_t uint32_t
 #endif // __has_include
+#endif // __cplusplus
 
 #ifdef __cplusplus
 extern "C" {
