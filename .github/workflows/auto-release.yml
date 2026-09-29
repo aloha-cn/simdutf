@@ -1,0 +1,146 @@
+name: Auto Sync and Release
+
+on:
+  schedule:
+    # Check new release on upstream every 6 hours
+    # Notice: UTC time for cron
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+    # Can be triggered manually
+
+jobs:
+  sync-rebase-release:
+    runs-on: ubuntu-latest
+    env:
+      GH_REPO: ${{ github.repository }}
+    if: ${{ github.event.repository.fork }} # Make sure it's the fork repo
+
+    permissions:
+      contents: write # Needs write permission
+
+    steps:
+      - name: Checkout your fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Fetch all history
+          ref: brew_fix # My branch
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/simdutf/simdutf.git
+
+      - name: Fetch upstream tags
+        run: |
+          git fetch upstream --tags
+
+      - name: Find latest upstream release tag
+        id: find_tag
+        run: |
+          # Get the latest release tag from the upstream (format: v*.*.*)
+          LATEST_TAG=$(git ls-remote --tags upstream 'v*' \
+              | awk '{print $2}' \
+              | sed 's|refs/tags/||' \
+              | grep -v '\^{}' \
+              | sort -V \
+              | tail -n 1)
+          if [ -z "$LATEST_TAG" ]; then
+            echo "No upstream release tag found."
+            exit 1
+          fi
+          echo "latest_upstream_tag=$LATEST_TAG" >> $GITHUB_OUTPUT
+          echo "Latest upstream tag: $LATEST_TAG"
+
+      - name: Check if tag already exists
+        id: check
+        run: |
+          UPSTREAM_TAG=${{ steps.find_tag.outputs.latest_upstream_tag }}
+          MY_TAG="${UPSTREAM_TAG}_brew_fix"
+
+          if git ls-remote --tags origin "$MY_TAG" | grep -q "$MY_TAG"; then
+            echo "already_processed=true" >> $GITHUB_OUTPUT
+          else
+            echo "already_processed=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Rebase your branch onto upstream tag
+        if: steps.check.outputs.already_processed == 'false'
+        run: |
+          git rebase ${{ steps.find_tag.outputs.latest_upstream_tag }}
+        continue-on-error: false
+
+      - name: Push rebased branch
+        if: steps.check.outputs.already_processed == 'false' && success()
+        run: |
+          git push origin brew_fix --force-with-lease
+
+      - name: Create your own tag
+        id: create_tag
+        if: steps.check.outputs.already_processed == 'false' && success()
+        run: |
+          UPSTREAM_TAG=${{ steps.find_tag.outputs.latest_upstream_tag }}
+          MY_TAG="${UPSTREAM_TAG}_brew_fix"
+          git tag $MY_TAG
+          git push origin $MY_TAG
+          echo "my_tag=$MY_TAG" >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        id: create_release
+        if: steps.check.outputs.already_processed == 'false' && success()
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.create_tag.outputs.my_tag }}
+          name: "${{ steps.create_tag.outputs.my_tag }}"
+          body: |
+            Customized Release based on upstream ${{ steps.find_tag.outputs.latest_upstream_tag }}
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute SHA256 of release tarball
+        id: sha
+        if: steps.check.outputs.already_processed == 'false' && success()
+        run: |
+          MY_TAG=${{ steps.create_tag.outputs.my_tag }}
+          TARBALL_URL="https://github.com/${{ github.repository }}/archive/refs/tags/${MY_TAG}.tar.gz"
+
+          echo "Downloading $TARBALL_URL ..."
+          curl -sSL -o /tmp/release.tar.gz "$TARBALL_URL"
+
+          SHA256=$(sha256sum /tmp/release.tar.gz | awk '{print $1}')
+          echo "sha256=$SHA256" >> $GITHUB_OUTPUT
+          echo "Computed SHA256: $SHA256"
+
+      - name: Update Release Notes
+        if: steps.check.outputs.already_processed == 'false' && success()
+        run: |
+          MY_TAG=${{ steps.create_tag.outputs.my_tag }}
+          SHA256=${{ steps.sha.outputs.sha256 }}
+
+          # Write notes into a file
+          cat > /tmp/release-notes.md <<EOF
+          \# brew edit simdutf
+
+          1.    url "https://github.com/${{ github.repository }}/archive/refs/tags/${MY_TAG}.tar.gz"
+          2.    sha256 "${SHA256}"
+          3.    head "https://github.com/${{ github.repository }}.git", branch: "brew_fix"
+
+          \`\`\`
+          \$ export HOMEBREW_NO_INSTALL_FROM_API=1
+          \$ brew install simdutf
+          \`\`\`
+          EOF
+
+          echo "=== Release notes content ==="
+          cat /tmp/release-notes.md
+
+          gh release edit "$MY_TAG" \
+            --repo "${{ github.repository }}" \
+            --notes-file /tmp/release-notes.md
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
